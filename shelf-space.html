@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SHELF SPACE — Bottles Drop</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;height:100%;background:#0c0608;overflow:hidden;font-family:system-ui,sans-serif;color:#ddd}
+  #stage{position:fixed;inset:0}
+  canvas{display:block}
+  .hud{position:fixed;z-index:10;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#aaa}
+  .title{top:20px;left:0;right:0;text-align:center;pointer-events:none}
+  .title b{color:#ec4899;letter-spacing:.2em;font-size:13px}
+  .ctrls{top:16px;right:16px;display:flex;gap:8px;flex-direction:column}
+  .ctrls button{font:inherit;font-size:10px;letter-spacing:.16em;text-transform:uppercase;background:#1a1a1a;color:#ddd;border:1px solid #333;padding:10px 14px;cursor:pointer;transition:all .15s}
+  .ctrls button:hover{background:#252525;border-color:#555}
+  .ctrls button.recording{background:#7a1a1a;border-color:#dc2626;color:#fff}
+  .hint{bottom:16px;left:0;right:0;text-align:center;font-size:10px;color:#666;pointer-events:none}
+  .status{bottom:50px;left:0;right:0;text-align:center;font-size:11px;color:#ec4899;pointer-events:none;opacity:0;transition:opacity .2s}
+  .status.show{opacity:1}
+  .loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#ec4899;letter-spacing:.3em;font-size:10px;z-index:5}
+  .loading.hide{display:none}
+  body.embed .hud{display:none!important}
+  body.embed .loading{color:#7a1560}
+</style>
+</head>
+<body>
+<script>if(new URLSearchParams(location.search).has('embed'))document.body.classList.add('embed');</script>
+<div id="stage"></div>
+<div id="loading" class="loading">LOADING…</div>
+<div class="hud title">COLA WARS · <b>SHELF SPACE</b> · BOTTLES DROP</div>
+<div class="hud ctrls">
+  <button id="rec">● Record video</button>
+  <button id="viewMode">↻ Top-down</button>
+  <button id="debugRings">⯅ Debug slots</button>
+</div>
+<div class="hud status" id="status"></div>
+<div class="hud hint">5.5s loop · 18 bottles · calibrated · drag to orbit · scroll to zoom</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
+
+/* ============================================================
+   SHELF SPACE — 3D sister of head-space-caps-drop-stacks.
+   Same architecture: Three.js slab on a walnut table, 22° product-shot
+   camera, three-point lighting, physics-feel drop.
+   Calibrated from click session (2026-04-19) — slots land exactly
+   on the printed red outlines.
+   ============================================================ */
+
+const BOARD_W = 9.6;                              // board width (world units) — matches head-space feel
+const BOARD_ASPECT = 5504 / 3130;                 // ≈ 1.7585
+const BOARD_H = BOARD_W / BOARD_ASPECT;           // ≈ 5.46
+const BOARD_T = 0.06;                             // board thickness — matches head-space
+
+// CALIBRATED slot grid — captured by click session.
+const COOLER_X_PCTS = [12.0, 30.95, 50.05, 69.0, 88.0];
+const ROW_Y_PCTS    = [39.69, 57.55, 74.75];
+const SLOT_DX_PCT   = 3.22;
+const SLOTS_PER_SHELF = 5;
+
+const BOTTLE_COLORS = {
+  red:    0xdc2626,
+  yellow: 0xeab308,
+  purple: 0x9333ea,
+  pink:   0xec4899,
+};
+
+// 18-bottle plan:
+//   1. Only empty-outline shelves (FD bottom IS included now)
+//   2. Contiguous left-to-right (slot 0 first, no gaps)
+//   3. No color repeats within a shelf
+// Format: [coolerIdx, rowIdx, slotIdx, color]
+const BOTTLE_PLAN = [
+  [0, 2, 0, 'red'],    [0, 2, 1, 'yellow'],
+  [1, 1, 0, 'purple'], [1, 1, 1, 'yellow'],
+  [1, 2, 0, 'pink'],   [1, 2, 1, 'red'],
+  [2, 1, 0, 'yellow'], [2, 1, 1, 'purple'],
+  [2, 2, 0, 'pink'],
+  [3, 0, 0, 'red'],    [3, 0, 1, 'yellow'],
+  [3, 1, 0, 'purple'],
+  [3, 2, 0, 'red'],    [3, 2, 1, 'purple'],
+  [4, 0, 0, 'pink'],   [4, 0, 1, 'purple'],
+  [4, 1, 0, 'red'],    [4, 1, 1, 'pink'],
+];
+
+function pctToBoard(xPct, yPct){
+  return [
+    (xPct/100 - 0.5) * BOARD_W,
+    (yPct/100 - 0.5) * BOARD_H,
+  ];
+}
+function slotXZ(ci, ri, si){
+  const xPct = COOLER_X_PCTS[ci] + (si - 2) * SLOT_DX_PCT;
+  const yPct = ROW_Y_PCTS[ri];
+  return pctToBoard(xPct, yPct);
+}
+
+/* ========== animation timing — matches head-space-caps-drop-stacks ========== */
+const DROP_DURATION   = 0.55;
+const SETTLE_DURATION = 0.18;
+const INTRA_SHELF_DELAY = 0.14;
+const LOOP_LENGTH     = 5.5;
+const START_HEIGHT    = 8.0;
+const REST_HEIGHT     = 0.02;
+
+function easeInQuint(t){ return t*t*t*t*t; }
+
+/* ========== renderer + scene — same as head-space ========== */
+const stage = document.getElementById('stage');
+const renderer = new THREE.WebGLRenderer({ antialias:true, preserveDrawingBuffer:true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x1a1008, 1);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+stage.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1008);
+// Fog pushed far enough that user-zoom-out doesn't darken the scene
+scene.fog = new THREE.Fog(0x1a1008, 60, 160);
+
+// Near top-down default — ~18° tilt forward — whole board including base fits.
+const camera = new THREE.PerspectiveCamera(42, window.innerWidth/window.innerHeight, 0.1, 200);
+const IS_EMBED = new URLSearchParams(location.search).has('embed');
+const DEFAULT_POS = IS_EMBED
+  ? new THREE.Vector3(0, 10.2, 3.0)
+  : new THREE.Vector3(0, 12.5, 4.0);
+const DEFAULT_TGT = new THREE.Vector3(0, 0, 0.3);  // look slightly toward board front so base isn't cut
+camera.position.copy(DEFAULT_POS);
+camera.lookAt(DEFAULT_TGT);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.05;
+controls.enableZoom = false;             // disable OrbitControls' built-in zoom — custom smooth below
+controls.minDistance = 5;
+controls.maxDistance = 35;
+controls.maxPolarAngle = Math.PI * 0.5;
+controls.target.copy(DEFAULT_TGT);
+
+/* ---------- custom smooth zoom ----------
+ * OrbitControls' wheel zoom (even with damping) often reads as discrete steps.
+ * This maintains its own `targetDistance` that changes on wheel events and is
+ * lerped toward each frame, producing a true gradient between close and far.
+ */
+const ZOOM_MIN = 5;
+const ZOOM_MAX = 35;
+let targetDistance = camera.position.distanceTo(controls.target);
+
+renderer.domElement.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  // deltaY ~100 per click on standard mice. Factor 1.0015^deltaY gives ~16% per click.
+  const factor = Math.pow(1.0015, e.deltaY);
+  targetDistance = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, targetDistance * factor));
+  manualView = true;
+}, { passive: false });
+
+function applySmoothZoom(){
+  const dir = camera.position.clone().sub(controls.target);
+  const currentDistance = dir.length();
+  // Lerp current distance toward target, 12% per frame — feels continuous at 60fps
+  const next = currentDistance + (targetDistance - currentDistance) * 0.12;
+  if (Math.abs(next - currentDistance) < 0.0005) return;
+  dir.setLength(next);
+  camera.position.copy(controls.target).add(dir);
+}
+
+/* ========== three-point lighting (identical to head-space) ========== */
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+const key = new THREE.DirectionalLight(0xfff2d0, 1.2);
+key.position.set(4, 9, 6);
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+key.shadow.camera.left = -8; key.shadow.camera.right = 8;
+key.shadow.camera.top = 6;   key.shadow.camera.bottom = -6;
+key.shadow.camera.near = 1;  key.shadow.camera.far = 25;
+key.shadow.bias = -0.0005;
+scene.add(key);
+const fill = new THREE.DirectionalLight(0x9ac3ff, 0.5);
+fill.position.set(-6, 4, 4);
+scene.add(fill);
+const rim = new THREE.DirectionalLight(0xffb47a, 0.7);
+rim.position.set(0, 3, -6);
+scene.add(rim);
+
+/* ========== walnut table (identical procedural texture to head-space) ========== */
+function makeWalnutTex(){
+  const W = 1024, H = 1024;
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const ctx = c.getContext('2d');
+  const grad = ctx.createRadialGradient(W/2, H/2, W*0.15, W/2, H/2, W*0.75);
+  grad.addColorStop(0, '#c9a474'); grad.addColorStop(1, '#8e6641');
+  ctx.fillStyle = grad; ctx.fillRect(0,0,W,H);
+  for (let i=0; i<280; i++){
+    const y = Math.random()*H;
+    const amp = 20 + Math.random()*60;
+    const freq = 0.003 + Math.random()*0.01;
+    const alpha = 0.03 + Math.random()*0.07;
+    ctx.strokeStyle = `rgba(${50+Math.random()*20|0},${32+Math.random()*14|0},${18+Math.random()*8|0},${alpha})`;
+    ctx.lineWidth = 0.8 + Math.random()*2.5;
+    ctx.beginPath(); ctx.moveTo(0, y);
+    for (let x=0; x<=W; x+=6){
+      const yy = y + Math.sin(x*freq + i)*amp*0.3 + (Math.random()-0.5)*2;
+      ctx.lineTo(x, yy);
+    }
+    ctx.stroke();
+  }
+  for (let i=0; i<6; i++){
+    const cx = Math.random()*W, cy = Math.random()*H;
+    const r = 20 + Math.random()*60;
+    const g = ctx.createRadialGradient(cx,cy,0, cx,cy,r);
+    g.addColorStop(0, 'rgba(50,32,18,0.25)'); g.addColorStop(1, 'rgba(50,32,18,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fill();
+  }
+  const vg = ctx.createRadialGradient(W/2, H/2, W*0.3, W/2, H/2, W*0.65);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.25)');
+  ctx.fillStyle = vg; ctx.fillRect(0,0,W,H);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return tex;
+}
+const tableTex = makeWalnutTex();
+const table = new THREE.Mesh(
+  new THREE.PlaneGeometry(24, 16),
+  new THREE.MeshStandardMaterial({ map:tableTex, roughness:0.82, metalness:0.02 })
+);
+table.rotation.x = -Math.PI/2;
+table.position.y = -0.04;
+table.receiveShadow = true;
+scene.add(table);
+
+/* ========== board ========== */
+let boardLoaded = false, bottlesLoaded = false;
+function tryStart(){
+  if (boardLoaded && bottlesLoaded){
+    document.getElementById('loading').classList.add('hide');
+    clock.start();
+  }
+}
+
+new THREE.TextureLoader().load('shelfspace-board.jpg', (tex) => {
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  const boardTopMat  = new THREE.MeshStandardMaterial({ map:tex, roughness:0.5,  metalness:0.05 });
+  const boardSideMat = new THREE.MeshStandardMaterial({ color:0x1a0f2c, roughness:0.7, metalness:0.1 });
+  const boardBotMat  = new THREE.MeshStandardMaterial({ color:0x0c0520, roughness:0.9, metalness:0 });
+  const slab = new THREE.Mesh(
+    new THREE.BoxGeometry(BOARD_W, BOARD_T, BOARD_H),
+    [boardSideMat, boardSideMat, boardTopMat, boardBotMat, boardSideMat, boardSideMat]
+  );
+  slab.position.y = BOARD_T / 2;
+  slab.castShadow = true;
+  slab.receiveShadow = true;
+  scene.add(slab);
+
+  // Debug rings — green oval outlines at each slot position (bottle-silhouette shaped)
+  const debugGroup = new THREE.Group();
+  debugGroup.visible = false;
+  const slotW = (SLOT_DX_PCT/100) * BOARD_W * 0.82;
+  const slotL = (slotW * 225 / 95) * 0.95;      // match SVG aspect ~2.37
+  const ringMat = new THREE.LineBasicMaterial({ color:0x00ff88, depthTest:false });
+  BOTTLE_PLAN.forEach(([ci, ri, si]) => {
+    const [bx, bz] = slotXZ(ci, ri, si);
+    const pts = [];
+    for (let i=0; i<=48; i++){
+      const a = (i/48) * Math.PI * 2;
+      pts.push(new THREE.Vector3(Math.cos(a) * slotW/2, 0, Math.sin(a) * slotL/2));
+    }
+    const g = new THREE.BufferGeometry().setFromPoints(pts);
+    const line = new THREE.Line(g, ringMat);
+    line.position.set(bx, BOARD_T + 0.02, bz);
+    line.renderOrder = 999;
+    debugGroup.add(line);
+  });
+  scene.add(debugGroup);
+  window.__debugGroup = debugGroup;
+
+  boardLoaded = true; tryStart();
+}, undefined, (err) => console.error('[shelf] board load FAILED', err));
+
+/* ========== bottles — extruded SVG laid flat on the board ========== */
+const bottles = [];
+
+new SVGLoader().load('bottle.svg', (data) => {
+  const shapes = [];
+  data.paths.forEach(p => SVGLoader.createShapes(p).forEach(s => shapes.push(s)));
+  if (!shapes.length){ console.error('no bottle shapes'); return; }
+
+  // Extrude with real thickness so bottles read as 3D tokens.
+  const rawGeo = new THREE.ExtrudeGeometry(shapes, {
+    depth: 38,                 // meaningful 3D depth
+    bevelEnabled: true,
+    bevelThickness: 4,
+    bevelSize: 3,
+    bevelSegments: 4,
+    curveSegments: 32,
+  });
+  // LAY FLAT so silhouette matches the printed outline viewed from above.
+  //   rotateX(-π/2): SVG y-axis (bottle length) → world Z (board front-back)
+  //   rotateY(π):    neck points toward -Z (back of board, matching outlines)
+  rawGeo.rotateX(-Math.PI / 2);
+  rawGeo.rotateY(Math.PI);
+  rawGeo.computeBoundingBox();
+  const bb = rawGeo.boundingBox;
+  rawGeo.translate(
+    -(bb.max.x + bb.min.x) / 2,   // center X
+    -bb.min.y,                    // base sits on board (y=0 local)
+    -(bb.max.z + bb.min.z) / 2,   // center Z
+  );
+  rawGeo.computeBoundingBox();
+  const sizeRaw = new THREE.Vector3();
+  rawGeo.boundingBox.getSize(sizeRaw);
+
+  // Scale: bottle footprint = printed outline footprint.
+  // Outline on board is ~2.4% × 8% of image.
+  // slot_width_world = outline width in world units
+  // slot_length_world = outline length in world units
+  const slot_w_world = (2.4 / 100) * BOARD_W;            // ~0.23
+  const slot_l_world = (8.0 / 100) * BOARD_H;            // ~0.44
+  let scale = slot_w_world / sizeRaw.x;                  // fit width first
+  if (sizeRaw.z * scale > slot_l_world) {
+    scale = slot_l_world / sizeRaw.z;                    // clamp length if needed
+  }
+  rawGeo.scale(scale, scale, scale);
+  rawGeo.computeVertexNormals();
+  rawGeo.computeBoundingBox();
+  const size = new THREE.Vector3();
+  rawGeo.boundingBox.getSize(size);
+  console.log('[shelf] bottle', { w:size.x.toFixed(3), thick:size.y.toFixed(3), len:size.z.toFixed(3), scale:scale.toFixed(5) });
+
+  // Stagger schedule — per-shelf drops left-to-right, shelves step across board
+  const tailRoom = 0.7;
+  const usable = LOOP_LENGTH - tailRoom - (DROP_DURATION + SETTLE_DURATION);
+  const perStep = usable / Math.max(1, BOTTLE_PLAN.length - 1);
+
+  BOTTLE_PLAN.forEach(([ci, ri, si, colorKey], idx) => {
+    const color = BOTTLE_COLORS[colorKey];
+    const [bx, bz] = slotXZ(ci, ri, si);
+    const landedY = BOARD_T + REST_HEIGHT;
+
+    const mat = new THREE.MeshStandardMaterial({
+      color, roughness: 0.42, metalness: 0.14,
+    });
+    const mesh = new THREE.Mesh(rawGeo, mat);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+
+    mesh.position.set(bx, START_HEIGHT, bz);
+
+    // Tiny tilt for landing wobble
+    const a = idx * 2.1;
+    const tiltAxis = [Math.cos(a), Math.sin(a)];
+
+    scene.add(mesh);
+    bottles.push({
+      mesh, bx, bz, landedY,
+      delay: idx * perStep,
+      tiltAxis,
+    });
+  });
+
+  bottlesLoaded = true; tryStart();
+}, undefined, (err) => console.error('[shelf] bottle SVG FAILED', err));
+
+/* ========== loop (mirror of head-space) ========== */
+const clock = new THREE.Clock(false);
+let manualView = false;
+let isTop = false;
+
+function animate(){
+  requestAnimationFrame(animate);
+  const t = clock.getElapsedTime() % LOOP_LENGTH;
+
+  bottles.forEach(b => {
+    const local = t - b.delay;
+    let y, tilt = 0;
+
+    if (local < 0){
+      b.mesh.visible = false;
+      return;
+    }
+    b.mesh.visible = true;
+
+    if (local < DROP_DURATION){
+      const k = local / DROP_DURATION;
+      const e = easeInQuint(k);
+      y = START_HEIGHT + (b.landedY - START_HEIGHT) * e;
+    } else if (local < DROP_DURATION + SETTLE_DURATION){
+      const s = (local - DROP_DURATION) / SETTLE_DURATION;
+      tilt = Math.sin(s * Math.PI) * (1 - s) * 0.05;
+      y = b.landedY + Math.sin(s * Math.PI) * 0.01;
+    } else {
+      y = b.landedY;
+    }
+
+    b.mesh.position.set(b.bx, y, b.bz);
+    b.mesh.rotation.x = tilt * b.tiltAxis[0];
+    b.mesh.rotation.z = tilt * b.tiltAxis[1];
+  });
+
+  // OrbitControls handles drag/orbit; our custom smooth-zoom handles wheel.
+  controls.update();
+  applySmoothZoom();
+
+  renderer.render(scene, camera);
+}
+animate();
+
+controls.addEventListener('start', () => { manualView = true; });
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* ========== top-down toggle ========== */
+document.getElementById('viewMode').onclick = () => {
+  isTop = !isTop; manualView = false;
+  // Toggle is now: default (near top-down) ↔ full product-shot tilt
+  const targetPos = isTop ? new THREE.Vector3(0, 3.8, 9.2) : DEFAULT_POS.clone();
+  animateCamera(targetPos, DEFAULT_TGT, () => {
+    document.getElementById('viewMode').textContent = isTop ? '↻ Top-down' : '↻ Product shot';
+  });
+};
+
+/* ========== debug rings toggle ========== */
+let debugOn = false;
+document.getElementById('debugRings').onclick = () => {
+  debugOn = !debugOn;
+  if (window.__debugGroup) window.__debugGroup.visible = debugOn;
+  bottles.forEach(b => { b.mesh.visible = !debugOn; b.shadow.visible = !debugOn; });
+  const btn = document.getElementById('debugRings');
+  btn.textContent = debugOn ? '⯅ Hide rings' : '⯅ Debug slots';
+  btn.style.background = debugOn ? '#3a1a1a' : '';
+};
+
+function animateCamera(targetPos, targetLook, onDone){
+  manualView = true;
+  const startPos = camera.position.clone();
+  const startLook = controls.target.clone();
+  const dur = 700, t0 = performance.now();
+  function step(){
+    const k = Math.min((performance.now()-t0)/dur, 1);
+    const e = k<.5 ? 2*k*k : 1-Math.pow(-2*k+2,2)/2;
+    camera.position.lerpVectors(startPos, targetPos, e);
+    controls.target.lerpVectors(startLook, targetLook, e);
+    if (k<1) requestAnimationFrame(step);
+    else { manualView = false; onDone && onDone(); }
+  }
+  step();
+}
+
+/* ========== recording (same as head-space) ========== */
+let rec = null, chunks = [];
+const recBtn = document.getElementById('rec');
+const statusEl = document.getElementById('status');
+function setStatus(msg, showMs=2000){
+  statusEl.textContent = msg; statusEl.classList.add('show');
+  if (showMs > 0) setTimeout(() => statusEl.classList.remove('show'), showMs);
+}
+recBtn.onclick = () => {
+  if (rec && rec.state === 'recording'){ rec.stop(); return; }
+  const canvas = renderer.domElement;
+  chunks = [];
+  const stream = canvas.captureStream(30);
+  const mimes = ['video/mp4;codecs=avc1.42E01E', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+  const mime = mimes.find(m => MediaRecorder.isTypeSupported(m)) || '';
+  try { rec = new MediaRecorder(stream, mime ? { mimeType:mime, videoBitsPerSecond:5_000_000 } : {}); }
+  catch (e){ rec = new MediaRecorder(stream); }
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    const blob = new Blob(chunks, { type: rec.mimeType });
+    const ext = rec.mimeType.includes('mp4') ? 'mp4' : 'webm';
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `shelfspace-bottles-drop.${ext}`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    recBtn.textContent = '● Record video';
+    recBtn.classList.remove('recording');
+  };
+  rec.start();
+  recBtn.textContent = '■ Stop recording';
+  recBtn.classList.add('recording');
+  setStatus(`Recording 2 loops (${(LOOP_LENGTH*2).toFixed(1)}s)`, LOOP_LENGTH*2*1000 + 500);
+  setTimeout(() => { if (rec && rec.state === 'recording') rec.stop(); }, LOOP_LENGTH * 2 * 1000 + 200);
+};
+</script>
+</body>
+</html>
