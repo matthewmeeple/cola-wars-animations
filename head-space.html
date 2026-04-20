@@ -1,0 +1,609 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HEAD SPACE — Caps Drop (Stacks)</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;height:100%;background:#0c0608;overflow:hidden;font-family:system-ui,sans-serif;color:#ddd}
+  #stage{position:fixed;inset:0}
+  canvas{display:block}
+  .hud{position:fixed;z-index:10;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#aaa}
+  .title{top:20px;left:0;right:0;text-align:center;pointer-events:none}
+  .title b{color:#ec4899;letter-spacing:.2em;font-size:13px}
+  .ctrls{top:16px;right:16px;display:flex;gap:8px;flex-direction:column}
+  .ctrls button{font:inherit;font-size:10px;letter-spacing:.16em;text-transform:uppercase;background:#1a1a1a;color:#ddd;border:1px solid #333;padding:10px 14px;cursor:pointer;transition:all .15s}
+  .ctrls button:hover{background:#252525;border-color:#555}
+  .ctrls button.recording{background:#7a1a1a;border-color:#dc2626;color:#fff}
+  .hint{bottom:16px;left:0;right:0;text-align:center;font-size:10px;color:#666;pointer-events:none}
+  .status{bottom:50px;left:0;right:0;text-align:center;font-size:11px;color:#ec4899;pointer-events:none;opacity:0;transition:opacity .2s}
+  .status.show{opacity:1}
+  .loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#ec4899;letter-spacing:.3em;font-size:10px;z-index:5}
+  .loading.hide{display:none}
+  /* Embed mode: ?embed=1 hides HUD so this page can be iframed cleanly. */
+  body.embed .hud{display:none!important}
+  body.embed .loading{color:#7a1560}
+</style>
+</head>
+<body>
+<script>if(new URLSearchParams(location.search).has('embed'))document.body.classList.add('embed');</script>
+<div id="stage"></div>
+<div id="loading" class="loading">LOADING…</div>
+<div class="hud title">COLA WARS · <b>HEAD SPACE</b> · CAPS DROP · STACKS</div>
+<div class="hud ctrls">
+  <button id="rec">● Record video</button>
+  <button id="viewMode">↻ Top-down</button>
+  <button id="debugRings">⯅ Debug rings</button>
+</div>
+<div class="hud status" id="status"></div>
+<div class="hud hint">4.5s loop · 12 spots, stacks of 1–4 · drag to orbit · scroll to zoom</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+
+/* ========== board/world constants ========== */
+const BOARD_W = 9.2;
+const BOARD_ASPECT = 11008 / 5669; // ~1.942
+const BOARD_H = BOARD_W / BOARD_ASPECT;
+const BOARD_T = 0.06;
+
+// Measured pixel-exact from head-space-board.png (11008 × 5669)
+// by overlaying a 0.25% grid on high-resolution crops of each circle.
+// xPct/yPct = CENTER of the circle bead for that (column, row), as % of image dims.
+// SLOT_RADIUS_PCT = bead outer-ring radius as % of image WIDTH (11008).
+const CAP_COLUMNS = [
+  { col:'Freshness', xPct:13.00 },
+  { col:'Taste',     xPct:38.50 },
+  { col:'Youth',     xPct:64.50 },
+  { col:'Nostalgia', xPct:77.75 },
+];
+// Row Y centers in image %. Row 1 measured at 35.5; row spacing ~14% (measured).
+const ROW_Y_PCTS = [35.50, 49.50, 63.50];
+const SLOT_RADIUS_PCT = 3.00; // circle outer-ring radius as % of board width
+
+// Cap palette — 4 colors pulled from the column header art.
+const CAP_COLORS = {
+  red:    0xdc2626,
+  yellow: 0xeab308,
+  purple: 0x9333ea,
+  pink:   0xec4899,
+};
+// Each stack = ONE color (all caps in that stack match), but stacks within the
+// same column use DIFFERENT colors. Grid is [column][row].
+// No column repeats a color across its 3 rows; column-home colors stay dominant.
+const COLUMN_ROW_COLORS = [
+  // row0,              row1,              row2
+  [CAP_COLORS.red,     CAP_COLORS.yellow, CAP_COLORS.pink  ], // Freshness
+  [CAP_COLORS.yellow,  CAP_COLORS.purple, CAP_COLORS.red   ], // Taste
+  [CAP_COLORS.purple,  CAP_COLORS.pink,   CAP_COLORS.yellow], // Youth
+  [CAP_COLORS.pink,    CAP_COLORS.red,    CAP_COLORS.purple], // Nostalgia
+];
+
+// Back-compat exports so debug rings still render at row 1
+const CAP_SLOTS = CAP_COLUMNS.map((c, i) => ({ ...c, color: COLUMN_ROW_COLORS[i][0] }));
+const TOP_ROW_Y_PCT = ROW_Y_PCTS[0];
+
+// Per-(col,row) stack heights. Tallest in row 0, shortest in row 2.
+// Row 0 ∈ {3,4}, Row 1 ∈ {2,3}, Row 2 ∈ {1,2}.
+const STACK_HEIGHTS = [
+  // row0, row1, row2
+  [4, 3, 1], // Freshness
+  [3, 2, 2], // Taste
+  [4, 2, 1], // Youth
+  [3, 3, 2], // Nostalgia
+];
+
+function pctToBoard(xPct, yPct){
+  // Board lies flat on XZ plane. Image x → world x. Image y → world z.
+  return [
+    (xPct/100 - 0.5) * BOARD_W,
+    (yPct/100 - 0.5) * BOARD_H,
+  ];
+}
+
+/* ========== animation timing ========== */
+// Per-cap drop: DROP_DURATION → SETTLE_DURATION. Caps within a single stack
+// drop with INTRA_STACK_DELAY between them. Spots start in a staggered pattern.
+const DROP_DURATION = 0.55;
+const SETTLE_DURATION = 0.18;
+const INTRA_STACK_DELAY = 0.14;  // time between successive caps in same stack
+const LOOP_LENGTH = 4.5;
+const START_HEIGHT = 8.0;
+const REST_HEIGHT = 0.02; // cap sits just above board top (capHeight/2 added at runtime)
+
+function easeInQuint(t){ return t*t*t*t*t; }
+
+/* ========== renderer + scene ========== */
+const stage = document.getElementById('stage');
+const renderer = new THREE.WebGLRenderer({ antialias:true, preserveDrawingBuffer:true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x1a1008, 1);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+stage.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1008);
+scene.fog = new THREE.Fog(0x1a1008, 12, 28);
+
+// Camera slightly above and in front, ~22° downward pitch like a product shot
+// Position at y=3.4, z=8 -> angle = atan2(3.4, 8) ≈ 23°
+const camera = new THREE.PerspectiveCamera(30, window.innerWidth/window.innerHeight, 0.1, 100);
+// Embed mode: mostly top-down with a small tilt, so the board reads as a tracker
+// plan view when this file is iframed into the scroll.
+const IS_EMBED = new URLSearchParams(location.search).has('embed');
+const DEFAULT_POS = IS_EMBED
+  ? new THREE.Vector3(0, 10.2, 3.0)  // pulled back & higher so board fits 21:9 crop
+  : new THREE.Vector3(0, 3.6, 8.4);  // product-shot default for standalone viewing
+const DEFAULT_TGT = new THREE.Vector3(0, 0, 0);
+camera.position.copy(DEFAULT_POS);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 4;
+controls.maxDistance = 20;
+controls.maxPolarAngle = Math.PI * 0.48;
+controls.target.copy(DEFAULT_TGT);
+
+/* ========== three-point lighting ========== */
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+const key = new THREE.DirectionalLight(0xfff2d0, 1.2);
+key.position.set(4, 9, 6);
+key.castShadow = true;
+key.shadow.mapSize.set(2048,2048);
+key.shadow.camera.left = -8; key.shadow.camera.right = 8;
+key.shadow.camera.top = 6;  key.shadow.camera.bottom = -6;
+key.shadow.camera.near = 1; key.shadow.camera.far = 25;
+key.shadow.bias = -0.0005;
+scene.add(key);
+
+const fill = new THREE.DirectionalLight(0x9ac3ff, 0.5);
+fill.position.set(-6, 4, 4);
+scene.add(fill);
+
+const rim = new THREE.DirectionalLight(0xffb47a, 0.7);
+rim.position.set(0, 3, -6);
+scene.add(rim);
+
+/* ========== walnut table ========== */
+// Procedural walnut: base tint + noisy grain streaks generated to a canvas
+function makeWalnutTex(){
+  const W = 1024, H = 1024;
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const ctx = c.getContext('2d');
+  // base walnut brown — lightened (honey oak tones)
+  const grad = ctx.createRadialGradient(W/2, H/2, W*0.15, W/2, H/2, W*0.75);
+  grad.addColorStop(0, '#c9a474');
+  grad.addColorStop(1, '#8e6641');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0,0,W,H);
+  // streaks — reduced contrast so grain is visible but not heavy
+  for (let i=0; i<280; i++){
+    const y = Math.random()*H;
+    const amp = 20 + Math.random()*60;
+    const freq = 0.003 + Math.random()*0.01;
+    const alpha = 0.03 + Math.random()*0.07;
+    ctx.strokeStyle = `rgba(${50+Math.random()*20|0},${32+Math.random()*14|0},${18+Math.random()*8|0},${alpha})`;
+    ctx.lineWidth = 0.8 + Math.random()*2.5;
+    ctx.beginPath();
+    let x0 = 0, y0 = y;
+    ctx.moveTo(x0, y0);
+    for (let x=0; x<=W; x+=6){
+      const yy = y + Math.sin(x*freq + i)*amp*0.3 + (Math.random()-0.5)*2;
+      ctx.lineTo(x, yy);
+    }
+    ctx.stroke();
+  }
+  // a few darker knots — softened
+  for (let i=0; i<6; i++){
+    const cx = Math.random()*W, cy = Math.random()*H;
+    const r = 20 + Math.random()*60;
+    const g = ctx.createRadialGradient(cx,cy,0, cx,cy,r);
+    g.addColorStop(0, 'rgba(50,32,18,0.25)');
+    g.addColorStop(1, 'rgba(50,32,18,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fill();
+  }
+  // vignette — softened so table edges stay readable
+  const vg = ctx.createRadialGradient(W/2, H/2, W*0.3, W/2, H/2, W*0.65);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.25)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0,0,W,H);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  return tex;
+}
+
+const tableTex = makeWalnutTex();
+const table = new THREE.Mesh(
+  new THREE.PlaneGeometry(24, 16),
+  new THREE.MeshStandardMaterial({ map:tableTex, roughness:0.82, metalness:0.02 })
+);
+table.rotation.x = -Math.PI/2;
+table.position.y = -0.04;
+table.receiveShadow = true;
+scene.add(table);
+
+/* ========== board ========== */
+let boardLoaded = false, capsLoaded = false;
+function tryStart(){
+  if (boardLoaded && capsLoaded){
+    document.getElementById('loading').classList.add('hide');
+    clock.start();
+    console.log('[caps-drop] scene ready, clock started');
+  }
+}
+
+const loader = new THREE.TextureLoader();
+loader.load('head-space-board.png',
+  (tex) => {
+    console.log('[caps-drop] board texture loaded', tex.image.width, 'x', tex.image.height);
+    tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+
+  const boardTopMat = new THREE.MeshStandardMaterial({ map:tex, roughness:0.5, metalness:0.05 });
+  const boardSideMat = new THREE.MeshStandardMaterial({ color:0x1a0f2c, roughness:0.7, metalness:0.1 });
+  const boardBotMat = new THREE.MeshStandardMaterial({ color:0x0c0520, roughness:0.9, metalness:0 });
+
+  const slab = new THREE.Mesh(
+    new THREE.BoxGeometry(BOARD_W, BOARD_T, BOARD_H),
+    // Box material order: +x, -x, +y(top), -y(bot), +z, -z
+    [boardSideMat, boardSideMat, boardTopMat, boardBotMat, boardSideMat, boardSideMat]
+  );
+  slab.position.y = BOARD_T / 2;
+  slab.castShadow = true;
+  slab.receiveShadow = true;
+  scene.add(slab);
+  window.__slab = slab;
+  window.__scene = scene;
+  window.__camera = camera;
+  console.log('[caps-drop] slab added at', slab.position.toArray(), 'size', BOARD_W, BOARD_T, BOARD_H);
+
+  /* ===== alignment debug rings (red wireframe circles at each slot) ===== */
+  const debugGroup = new THREE.Group();
+  debugGroup.visible = false;
+  const slotRadiusWorld = (SLOT_RADIUS_PCT/100) * BOARD_W;
+  // Visual ring thickness: scaled up from the 4px spec so it's readable on screen.
+  // Actual slot r_u is preserved; the ring is just thicker for visibility.
+  const ringThickness = 0.04;
+  const ringGeo = new THREE.RingGeometry(
+    slotRadiusWorld - ringThickness*0.5,
+    slotRadiusWorld + ringThickness*0.5,
+    128
+  );
+  const ringMat = new THREE.MeshBasicMaterial({ color:0xff2040, side:THREE.DoubleSide, depthTest:false, transparent:false });
+  CAP_SLOTS.forEach(slot => {
+    const ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.rotation.x = -Math.PI/2;
+    const [bx, bz] = pctToBoard(slot.xPct, TOP_ROW_Y_PCT);
+    ring.position.set(bx, BOARD_T + 0.02, bz);
+    ring.renderOrder = 999;
+    debugGroup.add(ring);
+  });
+  // center crosshair dot
+  const dotGeo = new THREE.CircleGeometry(0.04, 24);
+  const dotMat = new THREE.MeshBasicMaterial({ color:0xffff00, depthTest:false });
+  CAP_SLOTS.forEach(slot => {
+    const dot = new THREE.Mesh(dotGeo, dotMat);
+    dot.rotation.x = -Math.PI/2;
+    const [bx, bz] = pctToBoard(slot.xPct, TOP_ROW_Y_PCT);
+    dot.position.set(bx, BOARD_T + 0.021, bz);
+    dot.renderOrder = 1000;
+    debugGroup.add(dot);
+  });
+  scene.add(debugGroup);
+  window.__debugGroup = debugGroup;
+
+  boardLoaded = true; tryStart();
+  },
+  undefined,
+  (err) => console.error('[caps-drop] board load FAILED', err)
+);
+
+/* ========== caps ========== */
+const caps = []; // {mesh, shadow, bx, bz, delay, yaw, tiltAxis}
+let capGeo = null, capScale = 1, capHeight = 0.1;
+
+new OBJLoader().load('bottlecap.obj', (root) => {
+  let g = null;
+  root.traverse(o => { if (!g && o.isMesh) g = o.geometry; });
+  if (!g){ console.error('no cap geometry'); return; }
+  g.computeVertexNormals();
+  g.center();
+  g.computeBoundingBox();
+  const size = new THREE.Vector3();
+  g.boundingBox.getSize(size);
+  const dims = [size.x, size.y, size.z];
+  const heightAxis = dims.indexOf(Math.min(...dims));
+  const maxDiam = Math.max(...dims.filter((_,i)=>i!==heightAxis));
+  // Target cap diameter = slot_diameter - 4px clearance (4px at 11008 image width)
+  // slot_diameter_world = 2 * SLOT_RADIUS_PCT/100 * BOARD_W
+  // clearance_world      = 4 / 11008 * BOARD_W
+  const SLOT_DIAM_WORLD = 2 * (SLOT_RADIUS_PCT/100) * BOARD_W;
+  const CLEARANCE_WORLD = (4 / 11008) * BOARD_W;
+  const TARGET_DIAMETER = SLOT_DIAM_WORLD - 2 * CLEARANCE_WORLD;
+  capScale = TARGET_DIAMETER / maxDiam;
+  capHeight = dims[heightAxis] * capScale;
+  if (heightAxis !== 1){
+    const m = new THREE.Matrix4();
+    if (heightAxis === 0) m.makeRotationZ(Math.PI/2);
+    else if (heightAxis === 2) m.makeRotationX(Math.PI/2);
+    g.applyMatrix4(m);
+    g.computeVertexNormals();
+    g.computeBoundingBox();
+  }
+  capGeo = g;
+
+  // Build the drop schedule: spots staggered across the loop, then per-cap within-stack delays.
+  // Spot order: diagonal sweep (row,col) so it feels rhythmic, not strictly column-by-column.
+  const spots = [];
+  for (let r = 0; r < ROW_Y_PCTS.length; r++){
+    for (let c = 0; c < CAP_COLUMNS.length; c++){
+      const h = STACK_HEIGHTS[c][r];
+      if (h > 0) spots.push({ col:c, row:r, height:h });
+    }
+  }
+  // Diagonal-ish ordering: key = row + col
+  spots.sort((a,b) => {
+    const ka = a.row*1.0 + a.col*0.6;
+    const kb = b.row*1.0 + b.col*0.6;
+    return ka - kb;
+  });
+
+  // Time budget: all drops must complete (last cap settled) within LOOP_LENGTH - a little tail
+  const tailBreathingRoom = 0.6;
+  const usableWindow = LOOP_LENGTH - tailBreathingRoom;
+  // Compute per-spot start delay so last-cap-of-last-spot finishes within usableWindow
+  const spotStartSpan = Math.max(0.2, usableWindow - (DROP_DURATION + SETTLE_DURATION + INTRA_STACK_DELAY * 3));
+  const spotStartStep = spots.length > 1 ? spotStartSpan / (spots.length - 1) : 0;
+
+  // Spawn caps
+  let capIndex = 0;
+  spots.forEach((spot, sIdx) => {
+    const colDef = CAP_COLUMNS[spot.col];
+    const capColor = COLUMN_ROW_COLORS[spot.col][spot.row];
+    const yPct = ROW_Y_PCTS[spot.row];
+    const [bx, bz] = pctToBoard(colDef.xPct, yPct);
+    const spotStart = sIdx * spotStartStep;
+
+    for (let k = 0; k < spot.height; k++){
+      const mat = new THREE.MeshStandardMaterial({
+        color: capColor,
+        roughness: 0.5,
+        metalness: 0.15,
+      });
+      const mesh = new THREE.Mesh(capGeo, mat);
+      mesh.scale.setScalar(capScale);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+
+      const shadowMat = new THREE.MeshBasicMaterial({
+        color:0x000000, transparent:true, opacity:0, depthWrite:false,
+      });
+      const shadow = new THREE.Mesh(
+        new THREE.CircleGeometry(0.4, 32),
+        shadowMat
+      );
+      shadow.rotation.x = -Math.PI/2;
+
+      // randomized look: slight yaw + tilt axis per cap for natural landing
+      const yaw = (capIndex * 1.37 + k * 0.8) % (Math.PI*2);
+      const a = capIndex * 2.1 + k * 0.9;
+      const tiltAxis = [Math.cos(a), Math.sin(a)];
+
+      // Resting Y for this cap within the stack (cap k sits on top of cap k-1).
+      // Stack gap is small — caps nest but aren't perfectly flush.
+      const restY = BOARD_T + REST_HEIGHT + capHeight/2 + k * capHeight * 0.95;
+
+      mesh.position.set(bx, START_HEIGHT, bz);
+      mesh.rotation.y = yaw;
+      shadow.position.set(bx, BOARD_T + 0.002, bz);
+      shadow.scale.set(0.05, 0.05, 1);
+
+      scene.add(mesh);
+      scene.add(shadow);
+
+      caps.push({
+        mesh, shadow, bx, bz,
+        delay: spotStart + k * INTRA_STACK_DELAY,
+        yaw, tiltAxis,
+        color: capColor,
+        restY,
+        stackIdx: k,
+        stackSize: spot.height,
+      });
+      capIndex++;
+    }
+  });
+
+  console.log('[caps-drop-stacks] spawned', caps.length, 'caps across', spots.length, 'spots');
+
+  capsLoaded = true; tryStart();
+});
+
+/* ========== loop ========== */
+const clock = new THREE.Clock(false);
+let manualView = false;
+let isTop = false;
+
+function animate(){
+  requestAnimationFrame(animate);
+  const t = clock.getElapsedTime() % LOOP_LENGTH;
+
+  caps.forEach(c => {
+    const local = t - c.delay;
+    let y, tilt = 0, sScale, sOpacity;
+    const landedY = c.restY;
+    // Shadow is only really cast by the BOTTOM cap of each stack.
+    const shadowMax = c.stackIdx === 0 ? 0.5 : 0.0;
+
+    if (local < 0){
+      y = START_HEIGHT;
+      sScale = 0.05; sOpacity = 0;
+    } else if (local < DROP_DURATION){
+      const k = local / DROP_DURATION;
+      const e = easeInQuint(k);
+      y = START_HEIGHT + (landedY - START_HEIGHT) * e;
+      sScale = 0.15 + 0.85 * e;
+      sOpacity = shadowMax > 0 ? (0.05 + (shadowMax - 0.05) * e) : 0;
+    } else if (local < DROP_DURATION + SETTLE_DURATION){
+      const s = (local - DROP_DURATION) / SETTLE_DURATION;
+      tilt = Math.sin(s * Math.PI) * (1 - s) * 0.09; // ~5° peak
+      y = landedY + Math.sin(s * Math.PI) * 0.015;
+      sScale = 1.0; sOpacity = shadowMax;
+    } else {
+      y = landedY;
+      sScale = 1.0; sOpacity = shadowMax;
+    }
+
+    c.mesh.position.set(c.bx, y, c.bz);
+    c.mesh.rotation.y = c.yaw;
+    c.mesh.rotation.x = tilt * c.tiltAxis[0];
+    c.mesh.rotation.z = tilt * c.tiltAxis[1];
+
+    c.shadow.position.set(c.bx, BOARD_T + 0.004, c.bz);
+    c.shadow.scale.set(sScale, sScale, 1);
+    c.shadow.material.opacity = sOpacity;
+  });
+
+  // subtle camera breathing unless user is orbiting OR top-down mode is on
+  if (!manualView && !isTop){
+    const tFull = clock.getElapsedTime();
+    const yaw = Math.sin((tFull / LOOP_LENGTH) * Math.PI * 2) * 0.017; // ~1°
+    const r = Math.sqrt(DEFAULT_POS.x*DEFAULT_POS.x + DEFAULT_POS.z*DEFAULT_POS.z) || 8;
+    camera.position.x = Math.sin(yaw) * r;
+    camera.position.z = Math.cos(yaw) * r;
+    camera.position.y = DEFAULT_POS.y;
+    camera.lookAt(DEFAULT_TGT);
+  } else {
+    controls.update();
+  }
+
+  renderer.render(scene, camera);
+}
+animate();
+
+// mark manual view when user drags
+controls.addEventListener('start', () => { manualView = true; });
+
+/* ========== resize ========== */
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* ========== top-down toggle ========== */
+document.getElementById('viewMode').onclick = () => {
+  isTop = !isTop;
+  manualView = false;
+  const targetPos = isTop ? new THREE.Vector3(0, 8, 0.01) : DEFAULT_POS.clone();
+  animateCamera(targetPos, DEFAULT_TGT, () => {
+    document.getElementById('viewMode').textContent = isTop ? '↻ Product shot' : '↻ Top-down';
+  });
+};
+
+/* ========== debug rings toggle ========== */
+let debugOn = false;
+document.getElementById('debugRings').onclick = () => {
+  debugOn = !debugOn;
+  if (window.__debugGroup) window.__debugGroup.visible = debugOn;
+  // Hide caps & shadows while debugging so rings are unobstructed
+  caps.forEach(c => {
+    c.mesh.visible = !debugOn;
+    c.shadow.visible = !debugOn;
+  });
+  const btn = document.getElementById('debugRings');
+  btn.textContent = debugOn ? '⯅ Hide rings' : '⯅ Debug rings';
+  btn.style.background = debugOn ? '#3a1a1a' : '';
+};
+
+function animateCamera(targetPos, targetLook, onDone){
+  manualView = true; // suspend breathing during move
+  const startPos = camera.position.clone();
+  const startLook = controls.target.clone();
+  const dur = 700, t0 = performance.now();
+  function step(){
+    const k = Math.min((performance.now()-t0)/dur, 1);
+    const e = k<.5 ? 2*k*k : 1-Math.pow(-2*k+2,2)/2;
+    camera.position.lerpVectors(startPos, targetPos, e);
+    controls.target.lerpVectors(startLook, targetLook, e);
+    if (k<1) requestAnimationFrame(step);
+    else { manualView = false; onDone && onDone(); }
+  }
+  step();
+}
+
+/* ========== recording ========== */
+let rec = null, chunks = [];
+const recBtn = document.getElementById('rec');
+const statusEl = document.getElementById('status');
+
+function setStatus(msg, showMs=2000){
+  statusEl.textContent = msg;
+  statusEl.classList.add('show');
+  if (showMs > 0){
+    setTimeout(() => statusEl.classList.remove('show'), showMs);
+  }
+}
+
+recBtn.onclick = () => {
+  if (rec && rec.state === 'recording'){ rec.stop(); return; }
+  const canvas = renderer.domElement;
+  chunks = [];
+  const stream = canvas.captureStream(30);
+  // Prefer mp4 if the browser will make it; most won't from canvas.captureStream — fall back to webm.
+  const candidates = [
+    'video/mp4;codecs=avc1.42E01E',
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8',
+    'video/webm',
+  ];
+  const mime = candidates.find(m => MediaRecorder.isTypeSupported(m)) || '';
+  try {
+    rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 5_000_000 } : {});
+  } catch (e){
+    rec = new MediaRecorder(stream);
+  }
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    const blob = new Blob(chunks, { type: rec.mimeType });
+    const ext = rec.mimeType.includes('mp4') ? 'mp4' : 'webm';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `headspace-caps-drop-stacks.${ext}`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    recBtn.textContent = '● Record video';
+    recBtn.classList.remove('recording');
+    const sizeStr = blob.size > 1e6 ? (blob.size/1e6).toFixed(2)+' MB' : Math.round(blob.size/1024)+' KB';
+    setStatus(`Saved ${ext.toUpperCase()} · ${sizeStr}`, 5000);
+  };
+  rec.start();
+  recBtn.textContent = '■ Stop recording';
+  recBtn.classList.add('recording');
+  setStatus(`Recording ${mime.split(';')[0].split('/')[1] || 'video'} · 2 loops (${(LOOP_LENGTH*2).toFixed(1)}s)`, LOOP_LENGTH*2*1000 + 500);
+  setTimeout(() => { if (rec && rec.state === 'recording') rec.stop(); }, LOOP_LENGTH * 2 * 1000 + 200);
+};
+</script>
+</body>
+</html>

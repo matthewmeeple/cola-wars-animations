@@ -1,12 +1,44 @@
 <!doctype html>
-<html><head>
+<html lang="en">
+<head>
 <meta charset="utf-8">
 <title>Cola Wars · Animations</title>
-<meta http-equiv="refresh" content="0; url=shelf-space.html">
 <style>
-  body{margin:0;background:#1a1008;color:#eee;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh}
-  a{color:#ec4899}
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;height:100%;background:#1a1008;color:#eee;font-family:system-ui,sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px;gap:24px}
+  h1{margin:0;font-size:14px;letter-spacing:.2em;text-transform:uppercase;color:#ec4899}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;max-width:1100px;width:100%}
+  .card{background:#2a1a10;border:1px solid #3a2a1f;border-radius:8px;overflow:hidden;text-decoration:none;color:inherit;display:flex;flex-direction:column;transition:transform .15s,border-color .15s}
+  .card:hover{transform:translateY(-2px);border-color:#ec4899}
+  .card-body{padding:18px 22px}
+  .card-label{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#888;margin-bottom:4px}
+  .card-title{font-size:18px;font-weight:700;color:#ec4899;margin:0 0 6px}
+  .card-desc{font-size:13px;color:#bbb;line-height:1.5;margin:0}
+  .card-link{font-size:11px;color:#888;margin-top:10px;letter-spacing:.1em;text-transform:uppercase}
+  .foot{font-size:11px;color:#666;text-align:center;letter-spacing:.1em;text-transform:uppercase;margin-top:10px}
 </style>
-</head><body>
-<p>Loading <a href="shelf-space.html">Cola Wars · Shelf Space animation</a>…</p>
-</body></html>
+</head>
+<body>
+  <h1>Cola Wars · Animations</h1>
+  <div class="grid">
+    <a class="card" href="head-space.html">
+      <div class="card-body">
+        <div class="card-label">Mind Share</div>
+        <h2 class="card-title">Head Space · Caps Drop</h2>
+        <p class="card-desc">12 bottle caps drop into stacks of 1–4 across 4 Headspace tracker columns. 4.5 sec loop.</p>
+        <div class="card-link">Open →</div>
+      </div>
+    </a>
+    <a class="card" href="shelf-space.html">
+      <div class="card-body">
+        <div class="card-label">Shelf Share</div>
+        <h2 class="card-title">Shelf Space · Bottles Drop</h2>
+        <p class="card-desc">18 cola bottles land on empty shelf outlines across 5 retail coolers. 5.5 sec loop.</p>
+        <div class="card-link">Open →</div>
+      </div>
+    </a>
+  </div>
+  <div class="foot">Drag to orbit · scroll to zoom · hit Record to export MP4 · append ?embed=1 for clean iframe</div>
+</body>
+</html>
